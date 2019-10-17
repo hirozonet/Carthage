@@ -3,6 +3,7 @@ import ReactiveSwift
 import ReactiveTask
 import Result
 import XCDBLD
+import CommonCrypto
 
 struct CachedFramework: Codable {
 	enum CodingKeys: String, CodingKey {
@@ -428,8 +429,42 @@ public func createVersionFileForCommitish(
 										     frameworkName: frameworkName,
 										     frameworkSwiftVersion: frameworkSwiftVersion)
 					let details = SignalProducer<FrameworkDetail, CarthageError>(value: frameworkDetail)
-					let binaryURL = url.appendingPathComponent(frameworkName, isDirectory: false)
-					return SignalProducer.zip(hashForFileAtURL(binaryURL), details)
+					guard let bundle = Bundle(url: url),
+						let packageType = bundle.packageType else {
+						return SignalProducer<(String, FrameworkDetail), CarthageError>(error: .internalError(description: "\(url) is not a valid bundle."))
+					}
+					switch packageType {
+					case .framework, .bundle:
+						let binaryURL = bundle.executableURL!
+						return SignalProducer.zip(hashForFileAtURL(binaryURL), details)
+					case .xcFramework:
+						guard let xcFrameworkInfo = bundle.infoDictionary.flatMap(XCFrameworkInfo.init) else {
+							return SignalProducer<(String, FrameworkDetail), CarthageError>(error: .internalError(description: "\(url) cannot parse xcframework Info.plist"))
+						}
+						let sha256Context = UnsafeMutablePointer<CC_SHA256_CTX>.allocate(capacity: 1)
+						CC_SHA256_Init(sha256Context)
+						let cumulativeHashProducer = SignalProducer<XCFrameworkLibrary, CarthageError>(xcFrameworkInfo.availableLibraries)
+							.map { ($0.identifier as NSString).appendingPathComponent($0.path) as String }
+							.map { bundle.bundleURL.appendingPathComponent($0) }
+							.map { Bundle(url: $0)!.executableURL! }
+							.flatMap(.merge, hashForFileAtURL)
+							.map { $0.data(using: .utf8)! }
+							.reduce(into: sha256Context) { sha256Context, data in
+								var mutableData = data
+								CC_SHA256_Update(sha256Context, &mutableData, UInt32(mutableData.count))
+							}
+							.map { ctx -> String in
+								let sha56hash = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(CC_SHA256_DIGEST_LENGTH))
+								CC_SHA256_Final(sha56hash, ctx)
+								let data = Data(bytes: sha56hash, count: Int(CC_SHA256_DIGEST_LENGTH))
+								sha56hash.deallocate()
+								sha256Context.deallocate()
+								return data.reduce("") {$0 + String(format: "%02x", $1)}
+							}
+							return SignalProducer.zip(cumulativeHashProducer, details)
+					default:
+						return SignalProducer<(String, FrameworkDetail), CarthageError>(error: .internalError(description: "\(url) is not a supported bundle."))
+					}
 				}
 			}
 			.reduce(into: platformCaches) { (platformCaches: inout [String: [CachedFramework]], values: (String, FrameworkDetail)) in
